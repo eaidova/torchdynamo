@@ -8,6 +8,7 @@ import tempfile
 
 import numpy as np
 import torch
+from zmq import device
 
 from ..utils import identity
 from .subgraph import SubGraph
@@ -817,3 +818,74 @@ def fx2trt_compiler(gm: torch.fx.GraphModule, example_inputs):
             "FX2TRT conversion failed on the subgraph. Return GraphModule forward instead"
         )
         return gm.forward
+
+@create_backend
+def openvino(subgraph, **kwargs):
+    from openvino.runtime import Core, Type, PartialShape
+    from openvino.frontend import FrontEndManager
+    from openvino.frontend import pytorch as ov_pt_fe
+    scripted = subgraph.scripted
+    scripted.eval()
+    allow_fallback = kwargs.get('allow_fallback', True)
+    fr_model = torch.jit.freeze(scripted)
+    core = Core()
+    fe_manager = FrontEndManager()
+    fe = fe_manager.load_by_framework('pytorch')
+    dtype_mapping = {
+        torch.float32: Type.f32,
+        torch.float16: Type.f16,
+        torch.int64: Type.i64,
+        torch.int32: Type.i32,
+        torch.uint8: Type.u8,
+        torch.int8: Type.i8,
+        torch.bool: Type.boolean
+
+    }
+
+
+    try:
+        decoder = ov_pt_fe.TorchScriptPythonDecoder(fr_model.inlined_graph)
+        im = fe.load(decoder)
+        om = fe.convert(im)
+        try:
+            for idx, input_data in enumerate(subgraph.example_inputs):
+                om.inputs[idx].get_node().set_element_type(dtype_mapping[input_data.dtype])
+                om.inputs[idx].get_node().set_partial_shape(PartialShape(list(input_data.shape)))
+            om.validate_nodes_and_infer_types()
+            device = kwargs.get('device', 'CPU')
+            compiled_model = core.compile_model(om, device)
+            ov_pt_fe.decoders = []
+
+            def _call(*args):
+                res = compiled_model([a.detach().cpu().numpy() for a in args])
+                result = [torch.from_numpy(res[out]) for out in compiled_model.outputs]
+                return result
+            return subgraph.wrap_returns(_call)
+        except Exception as e:
+            if allow_fallback:
+                return subgraph.forward
+            raise e
+    except Exception as e:
+        if not allow_fallback:
+            raise e            
+    return subgraph.forward
+
+
+@create_backend
+def openvino_onnx(subgraph, **kwargs):
+    from openvino.runtime import Core
+    core = Core()
+    device = kwargs.get('device', 'CPU')
+    allow_fallback = kwargs.get('allow_fallback', True)
+    try:
+        ov_model = core.read_model(subgraph.onnx_filename)
+        compiled_model = core.compile_model(ov_model, device)
+
+        def _call(*args):
+            res = compiled_model([input_data.detach().cpu().numpy() for input_data in args])
+            return [torch.from_numpy(res[out]) for out in compiled_model.outputs]
+        return subgraph.wrap_returns(_call)
+    except Exception as e:
+        if allow_fallback:
+            return subgraph.forward
+        raise e

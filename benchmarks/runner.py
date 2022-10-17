@@ -73,6 +73,7 @@ TABLE = {
         "trt": "-n100 --speedup-trt",
         "ts_nvfuser_cudagraphs": "--inductor-settings --float32 -n50 --backend=cudagraphs_ts",
         "inductor": "--inductor-settings --float32 -n50 --inductor",
+        "openvino": "--backend openvino --batch_size 1 --use_eval_mode"
     },
 }
 
@@ -282,7 +283,7 @@ def build_summary():
             out_io.write(f"{name} Absent\n")
 
     def env_var(name):
-        out_io.write(f"{name} = {os.environ[name]}\n")
+        out_io.write(f"{name} = {os.environ.get(name, '')}\n")
 
     out_io.write("## Commit hashes ##\n")
     print_commit_hash(".", "torchdynamo")

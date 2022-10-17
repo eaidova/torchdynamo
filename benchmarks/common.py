@@ -1189,19 +1189,27 @@ class BenchmarkRunner:
     def run_performance_test(
         self, name, model, example_inputs, optimize_ctx, experiment
     ):
+        from memory_profiler import memory_usage
         def warmup(fn, model, example_inputs, mode, niters=5):
             peak_mem = 0
             try:
                 if current_device == "cuda":
                     torch.cuda.reset_peak_memory_stats()
                     torch.cuda.empty_cache()
-                t0 = time.perf_counter()
-                for _ in range(niters):
-                    fn(model, example_inputs)
-                t1 = time.perf_counter()
-                latency = t1 - t0
-                if current_device == "cuda":
+                    t0 = time.perf_counter()
+                    for _ in range(niters):
+                        fn(model, example_inputs)
+                    t1 = time.perf_counter()
+                    latency = t1 - t0
                     peak_mem = get_peak_memory()
+                else:
+                    def check():
+                        for _ in range(niters):
+                            fn(model, example_inputs)
+                    t0 = time.perf_counter()
+                    mem = memory_usage(check)
+                    peak_mem = mem.max()
+
             except Exception as e:
                 log.exception(f"Failed for {mode} {e}")
                 return sys.exit(-1)
@@ -1475,6 +1483,9 @@ def parse_args():
         action="store_true",
         help="exports trace of kineto profiler",
     )
+    parser.add_argument(
+        '--use_eval_mode', action='store_true'
+    )
     parser.add_argument("--profiler_trace_name", help="Overwrites exported trace name")
 
     parser.add_argument(
@@ -1662,7 +1673,7 @@ def main(runner, original_dir=None):
 
     elif args.performance:
         # Ensure that we test on real scenarios
-        args.use_eval_mode = False
+        args.use_eval_mode = False if not args.use_eval_mode else args.use_eval_mode
 
     if args.partition_id > args.total_partitions or args.partition_id < 0:
         print("Invalid partition id")
