@@ -863,12 +863,12 @@ def openvino(subgraph, **kwargs):
             return subgraph.wrap_returns(_call)
         except Exception as e:
             if allow_fallback:
-                return subgraph.forward
+                return subgraph.model.forward
             raise e
     except Exception as e:
         if not allow_fallback:
             raise e            
-    return subgraph.forward
+    return subgraph.model.forward
 
 
 @create_backend
@@ -887,5 +887,5 @@ def openvino_onnx(subgraph, **kwargs):
         return subgraph.wrap_returns(_call)
     except Exception as e:
         if allow_fallback:
-            return subgraph.forward
+            return subgraph.model.forward
         raise e

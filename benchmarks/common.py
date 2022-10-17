@@ -1208,7 +1208,9 @@ class BenchmarkRunner:
                             fn(model, example_inputs)
                     t0 = time.perf_counter()
                     mem = memory_usage(check)
-                    peak_mem = mem.max()
+                    t1 = time.perf_counter()
+                    latency = t1 - t0
+                    peak_mem = max(mem)
 
             except Exception as e:
                 log.exception(f"Failed for {mode} {e}")
