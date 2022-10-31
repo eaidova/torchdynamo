@@ -821,9 +821,12 @@ def fx2trt_compiler(gm: torch.fx.GraphModule, example_inputs):
 
 @create_backend
 def openvino(subgraph, **kwargs):
+    import time
     from openvino.runtime import Core, Type, PartialShape
     from openvino.frontend import FrontEndManager
     from openvino.frontend import pytorch as ov_pt_fe
+    profile = kwargs.get('profile', False)
+    profile = profile and 'convert_status' in kwargs
     scripted = subgraph.scripted
     scripted.eval()
     allow_fallback = kwargs.get('allow_fallback', True)
@@ -839,38 +842,67 @@ def openvino(subgraph, **kwargs):
         torch.uint8: Type.u8,
         torch.int8: Type.i8,
         torch.bool: Type.boolean
-
     }
-
-
     try:
+        t0 = time.perf_counter()
         decoder = ov_pt_fe.TorchScriptPythonDecoder(fr_model.inlined_graph)
         im = fe.load(decoder)
         om = fe.convert(im)
+        t1 = time.perf_counter()
+        if profile:
+            kwargs['convert_status'].append(1)
+            kwargs['convert_time'].append(t1 - t0)
         try:
             for idx, input_data in enumerate(subgraph.example_inputs):
                 om.inputs[idx].get_node().set_element_type(dtype_mapping[input_data.dtype])
                 om.inputs[idx].get_node().set_partial_shape(PartialShape(list(input_data.shape)))
             om.validate_nodes_and_infer_types()
             device = kwargs.get('device', 'CPU')
+            t2 = time.perf_counter()
             compiled_model = core.compile_model(om, device)
-            ov_pt_fe.decoders = []
-
+            t3 = time.perf_counter()
+            if profile:
+                kwargs['load_status'].append(1)
+                kwargs['load_time'].append(t3 - t2)
             def _call(*args):
-                res = compiled_model([a.detach().cpu().numpy() for a in args])
+                ov_inputs = [a.detach().cpu().numpy() for a in args]
+                try:
+                    t4 = time.perf_counter()
+                    res = compiled_model(ov_inputs)
+                    t5 = time.perf_counter()
+                    if profile:
+                        kwargs['infer_time'].append(t5 - t4)
+                        kwargs['infer_status'].append(1)
+                except Exception as e:
+                    if profile:
+                        kwargs['infer_status'].append(0)
+                    return subgraph.model.forward(*args)
                 result = [torch.from_numpy(res[out]) for out in compiled_model.outputs]
                 return result
             return subgraph.wrap_returns(_call)
         except Exception as e:
             if allow_fallback:
+                if profile:
+                    kwargs['load_status'].append(0)
+                    kwargs['infer_status'].append(0)
                 return subgraph.model.forward
             raise e
     except Exception as e:
+        if profile:
+            kwargs['convert_status'].append(0)
+            kwargs['load_status'].append(0)
+            kwargs['infer_status'].append(0)
         if not allow_fallback:
             raise e            
     return subgraph.model.forward
 
 
+def openvino_debug(model, example_inputs,  **kwargs):
+    if not isinstance(model, SubGraph):
+        subgraph = SubGraph(model, example_inputs, '.')
+    else:
+        subgraph = model
+    return  openvino(subgraph, profile=True, **kwargs)
 @create_backend
 def openvino_onnx(subgraph, **kwargs):
     from openvino.runtime import Core

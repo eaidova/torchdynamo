@@ -73,7 +73,8 @@ TABLE = {
         "trt": "-n100 --speedup-trt",
         "ts_nvfuser_cudagraphs": "--inductor-settings --float32 -n50 --backend=cudagraphs_ts",
         "inductor": "--inductor-settings --float32 -n50 --inductor",
-        "openvino": "--backend openvino --batch_size 1 --use_eval_mode"
+        "openvino": "--speedup-ov --batch_size 1",
+        "openvino_debug": "--ov-debug"
     },
 }
 

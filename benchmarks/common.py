@@ -34,6 +34,7 @@ from torchdynamo.testing import format_speedup
 from torchdynamo.testing import same
 from torchdynamo.utils import clone_inputs
 from torchinductor.utils import fresh_triton_cache
+from torchdynamo.utils import torchscript as try_ts
 
 try:
     from functorch._src.aot_autograd import set_model_name
@@ -608,7 +609,7 @@ def print_aten_ops(gm, example_inputs):
     return aot_module(gm, fw_compiler=trace_printer, bw_compiler=trace_printer)
 
 
-def baselines(models, model_iter_fn, example_inputs, args):
+def baselines(models, model_iter_fn, example_inputs, args, **kwargs):
     """
     Common measurement code across all baseline experiments.
     """
@@ -649,11 +650,16 @@ def baselines(models, model_iter_fn, example_inputs, args):
             for s, p, m in zip(speedup, pvalue, [m for n, m in models[1:]])
         ]
     )
+    headers =  ("dev", "name", "batch_size") + tuple(n for n, m in models[1:])
+    row = [current_device, current_name, current_batch_size] + [f"{x:.4f}" for x in speedup]
+    if "compilation_latency" in kwargs:
+        headers = headers + ("compilation_latency", "compression_ratio")
+        row.append(kwargs["compilation_latency"])
+        row.append(kwargs["compression_ratio"])
     output_csv(
         output_filename,
-        ("dev", "name", "batch_size") + tuple(n for n, m in models[1:]),
-        [current_device, current_name, current_batch_size]
-        + [f"{x:.4f}" for x in speedup],
+        headers,
+        row
     )
     return result
 
@@ -663,6 +669,7 @@ def try_script(model, example_inputs):
         return torch.jit.script(model)
     except Exception:
         return None
+
 
 
 def speedup_experiment_ts(args, model_iter_fn, model, example_inputs):
@@ -723,6 +730,200 @@ def speedup_experiment_sr(args, model_iter_fn, model, example_inputs):
         example_inputs,
         args,
     )
+
+def speedup_experiment_openvino(args, model_iter_fn, model, example_inputs, **kwargs):
+    debug_info = {
+       # 'profile': True,
+        #'allow_fallback': False,
+        'convert_time': [],
+        'convert_status': [],
+        'load_status': [],
+        'infer_status': [],
+        'inference_time': [],
+        'load_time': []
+    }
+    def summarize_data(model_name, debug_info):
+        num_subgraphs = len(debug_info['convert_status'])
+        num_converted = len(debug_info['convert_status'])
+        total_convert_time = sum(debug_info['convert_time'])
+        num_loaded = sum(debug_info['load_status'])
+        num_inferred = sum(debug_info['infer_status'])
+        total_inference_time = sum(debug_info['inference_time'])
+        total_load_time = sum(debug_info['load_time'])
+        return ([
+            'model_name',
+            'num_clusters',
+            'num_converted',
+            'conversion_time',
+            'num_loaded',
+            'load_time',
+            'num_inferred',
+            'inference_time'
+        ]), [model_name, num_subgraphs, num_converted, total_convert_time, num_loaded, total_load_time, num_inferred, total_inference_time]
+    model.eval()
+    def debug_backend(model, example_inputs):
+        return backends.openvino(model, example_inputs, **debug_info)
+
+    #debug_model = torchdynamo.optimize('openvino_debug')(model, example_inputs=example_inputs, **debug_info)
+    #result = model_iter_fn(debug_model, example_inputs)
+
+    #debug_output_file = 'debug.csv'
+    #output_csv(debug_output_file, *summarize_data(current_name, debug_info))
+    openvino_model = backends.openvino(model, example_inputs)
+    scripted_model = try_ts(model, example_inputs)
+    frozen_scripted = torch.jit.freeze(scripted_model)
+    ofi_model = torch.jit.optimize_for_inference(scripted_model)
+    ofi_dynamo_model = backends.ofi(model, example_inputs)
+    m_onnxrt = backends.onnxrt_cpu(model, example_inputs)
+    #m_ipex = backends.ipex(model, example_inputs)
+    openvino_onnx = backends.openvino_onnx(model, example_inputs)
+    return baselines(
+        [
+            ("eager", model),
+            ('speedup', openvino_model),
+            ('openvino_onnx', openvino_onnx),
+            ('ofi_full', ofi_model),
+            ('ofi_dynamo', ofi_dynamo_model),
+            ('onnxrt', m_onnxrt),
+            #('ipex', m_ipex)
+        ],
+        model_iter_fn,
+        example_inputs,
+        args,
+        **kwargs
+    )
+    #return speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs)
+
+debug_info = {
+        'profile': True,
+        #'allow_fallback': False,
+        'convert_time': [],
+        'convert_status': [],
+        'load_status': [],
+        'infer_status': [],
+        'inference_time': [],
+        'load_time': []
+}
+def ov_debug_experiment(args, model_iter_fn, model, example_inputs):
+    #torchdynamo.reset()
+    #optimized_ctx = torchdynamo.optimize('openvino_debug')
+    debug_info = {
+        'profile': True,
+        #'allow_fallback': False,
+        'convert_time': [],
+        'convert_status': [],
+        'load_status': [],
+        'infer_status': [],
+        'inference_time': [],
+        'load_time': []
+    }
+
+    @torchdynamo.optimizations.backends.create_backend
+    def openvino_debug(subgraph, **kwargs):
+        import time
+        from openvino.runtime import Core, Type, PartialShape
+        from openvino.frontend import FrontEndManager
+        from openvino.frontend import pytorch as ov_pt_fe
+        profile = True
+        scripted = subgraph.scripted
+        scripted.eval()
+        allow_fallback = kwargs.get('allow_fallback', True)
+        fr_model = torch.jit.freeze(scripted)
+        core = Core()
+        fe_manager = FrontEndManager()
+        fe = fe_manager.load_by_framework('pytorch')
+        dtype_mapping = {
+            torch.float32: Type.f32,
+            torch.float16: Type.f16,
+            torch.int64: Type.i64,
+            torch.int32: Type.i32,
+            torch.uint8: Type.u8,
+            torch.int8: Type.i8,
+            torch.bool: Type.boolean
+        }
+        try:
+            t0 = time.perf_counter()
+            decoder = ov_pt_fe.TorchScriptPythonDecoder(fr_model.inlined_graph)
+            im = fe.load(decoder)
+            om = fe.convert(im)
+            t1 = time.perf_counter()
+            if profile:
+                debug_info['convert_status'].append(1)
+                debug_info['convert_time'].append(t1 - t0)
+            try:
+                for idx, input_data in enumerate(subgraph.example_inputs):
+                    om.inputs[idx].get_node().set_element_type(dtype_mapping[input_data.dtype])
+                    om.inputs[idx].get_node().set_partial_shape(PartialShape(list(input_data.shape)))
+                om.validate_nodes_and_infer_types()
+                device = kwargs.get('device', 'CPU')
+                t2 = time.perf_counter()
+                compiled_model = core.compile_model(om, device)
+                t3 = time.perf_counter()
+                if profile:
+                    debug_info['load_status'].append(1)
+                    debug_info['load_time'].append(t3 - t2)
+
+                def _call(*args):
+                    ov_inputs = [a.detach().cpu().numpy() for a in args]
+                    try:
+                        t4 = time.perf_counter()
+                        res = compiled_model(ov_inputs)
+                        t5 = time.perf_counter()
+                        if profile:
+                            debug_info['infer_time'].append(t5 - t4)
+                            debug_info['infer_status'].append(1)
+                    except Exception as e:
+                        if profile:
+                            debug_info['infer_status'].append(0)
+                        return subgraph.model.forward(*args)
+                    result = [torch.from_numpy(res[out]) for out in compiled_model.outputs]
+                    return result
+
+                return subgraph.wrap_returns(_call)
+            except Exception as e:
+                if allow_fallback:
+                    if profile:
+                        debug_info['load_status'].append(0)
+                        debug_info['infer_status'].append(0)
+                    return subgraph.model.forward
+                raise e
+        except Exception as e:
+            if profile:
+                debug_info['convert_status'].append(0)
+                debug_info['load_status'].append(0)
+                debug_info['infer_status'].append(0)
+            if not allow_fallback:
+                raise e
+        return subgraph.model.forward
+    def summarize_data(model_name, debug_info):
+        num_subgraphs = len(debug_info['convert_status'])
+        num_converted = len(debug_info['convert_status'])
+        total_convert_time = sum(debug_info['convert_time'])
+        num_loaded = sum(debug_info['load_status'])
+        num_inferred = sum(debug_info['infer_status'])
+        total_inference_time = sum(debug_info['inference_time'])
+        total_load_time = sum(debug_info['load_time'])
+        return ([
+            'model_name',
+            'num_clusters',
+            'num_converted',
+            'conversion_time',
+            'num_loaded',
+            'load_time',
+            'num_inferred',
+            'inference_time'
+        ]), [model_name, num_subgraphs, num_converted, total_convert_time, num_loaded, total_load_time, num_inferred, total_inference_time]
+    model.eval()
+    # def debug_backend(model, example_inputs):
+    #     return backends.openvino(model, example_inputs, **debug_info)
+    torchdynamo.reset()
+    debug_model = torchdynamo.optimize(openvino_debug)(model)
+    result = model_iter_fn(debug_model, example_inputs)
+
+    debug_output_file = 'debug.csv'
+    output_csv(output_filename, *summarize_data(current_name, debug_info))
+
+
 
 
 def speedup_experiment_onnx(args, model_iter_fn, model, example_inputs):
@@ -1240,7 +1441,7 @@ class BenchmarkRunner:
             #     f"ratio: {compression_ratio:.2f}"
             # )
 
-            if experiment.func is speedup_experiment:
+            if experiment.func is speedup_experiment or experiment.func is speedup_experiment_openvino:
                 experiment_kwargs["compilation_latency"] = compilation_time
                 experiment_kwargs["compression_ratio"] = compression_ratio
 
@@ -1531,6 +1732,7 @@ def parse_args():
         action="store_true",
         help="speedup using the ltc backend",
     )
+    group.add_argument('--speedup-ov', action='store_true')
     group.add_argument(
         "--speedup-ltc-trivial",
         action="store_true",
@@ -1608,6 +1810,7 @@ def parse_args():
         action="store_true",
         help="finds the largest batch size that could fit on GPUs",
     )
+    group.add_argument('--ov-debug', action='store_true')
 
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument(
@@ -1780,6 +1983,9 @@ def main(runner, original_dir=None):
         optimize_ctx = torchdynamo.optimize(dummy_fx_compile, nopython=args.nopython)
         experiment = speedup_experiment
         output_filename = "overheads.csv"
+    if args.ov_debug:
+        optimize_ctx = torchdynamo.optimize(backends.openvino, nopython=args.nopython)
+        experiment = ov_debug_experiment
     elif args.cold_start:
         optimize_ctx = torchdynamo.optimize("aot_nvfuser", nopython=args.nopython)
         experiment = cold_start_experiment
@@ -1819,6 +2025,12 @@ def main(runner, original_dir=None):
         )
         experiment = speedup_experiment
         output_filename = "speedups_ltc_trivial.csv"
+    elif args.speedup_ov:
+        optimize_ctx = torchdynamo.optimize(
+            backends.openvino, nopython=args.nopython
+        )
+        experiment = speedup_experiment_openvino
+        output_filename = 'speedup_ov.csv'
     elif args.speedup_ts:
         experiment = speedup_experiment_ts
         output_filename = "baseline_ts.csv"
