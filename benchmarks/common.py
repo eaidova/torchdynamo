@@ -650,8 +650,8 @@ def baselines(models, model_iter_fn, example_inputs, args, **kwargs):
             for s, p, m in zip(speedup, pvalue, [m for n, m in models[1:]])
         ]
     )
-    headers =  ("dev", "name", "batch_size") + tuple(n for n, m in models[1:])
-    row = [current_device, current_name, current_batch_size] + [f"{x:.4f}" for x in speedup]
+    headers =  ("dev", "name", "batch_size") + tuple(n for n, m in models[1:]) + tuple(f'{n}_time' for n,m in models)
+    row = [current_device, current_name, current_batch_size] + [f"{x:.4f}" for x in speedup] + [f"{x:.4f}" for x in median] 
     if "compilation_latency" in kwargs:
         headers = headers + ("compilation_latency", "compression_ratio")
         row.append(kwargs["compilation_latency"])
@@ -736,8 +736,11 @@ def speedup_experiment_openvino(args, model_iter_fn, model, example_inputs, **kw
        # 'profile': True,
         #'allow_fallback': False,
         'convert_time': [],
+        'convert_msg': [],
         'convert_status': [],
         'load_status': [],
+        'load_msg': [],
+        'infer_msg': [],
         'infer_status': [],
         'inference_time': [],
         'load_time': []
@@ -750,6 +753,10 @@ def speedup_experiment_openvino(args, model_iter_fn, model, example_inputs, **kw
         num_inferred = sum(debug_info['infer_status'])
         total_inference_time = sum(debug_info['inference_time'])
         total_load_time = sum(debug_info['load_time'])
+        convert_msg = ';'.join(debug_info['convert_msg'])
+        load_msg = ';'.join(debug_info['load_msg'])
+        infer_msg = ';'.join(debug_info['infer_msg'])
+        
         return ([
             'model_name',
             'num_clusters',
@@ -758,8 +765,11 @@ def speedup_experiment_openvino(args, model_iter_fn, model, example_inputs, **kw
             'num_loaded',
             'load_time',
             'num_inferred',
-            'inference_time'
-        ]), [model_name, num_subgraphs, num_converted, total_convert_time, num_loaded, total_load_time, num_inferred, total_inference_time]
+            'inference_time',
+            'convert_msg',
+            'load_msg',
+            'infer_msg'
+        ]), [model_name, num_subgraphs, num_converted, total_convert_time, num_loaded, total_load_time, num_inferred, total_inference_time, convert_msg, load_msg, infer_msg]
     model.eval()
     def debug_backend(model, example_inputs):
         return backends.openvino(model, example_inputs, **debug_info)
@@ -775,7 +785,7 @@ def speedup_experiment_openvino(args, model_iter_fn, model, example_inputs, **kw
     ofi_model = torch.jit.optimize_for_inference(scripted_model)
     ofi_dynamo_model = backends.ofi(model, example_inputs)
     m_onnxrt = backends.onnxrt_cpu(model, example_inputs)
-    #m_ipex = backends.ipex(model, example_inputs)
+    m_ipex = backends.ipex_fp32(model, example_inputs)
     openvino_onnx = backends.openvino_onnx(model, example_inputs)
     return baselines(
         [
@@ -785,7 +795,7 @@ def speedup_experiment_openvino(args, model_iter_fn, model, example_inputs, **kw
             ('ofi_full', ofi_model),
             ('ofi_dynamo', ofi_dynamo_model),
             ('onnxrt', m_onnxrt),
-            #('ipex', m_ipex)
+            ('ipex', m_ipex)
         ],
         model_iter_fn,
         example_inputs,
@@ -808,15 +818,43 @@ def ov_debug_experiment(args, model_iter_fn, model, example_inputs):
     #torchdynamo.reset()
     #optimized_ctx = torchdynamo.optimize('openvino_debug')
     debug_info = {
-        'profile': True,
+       # 'profile': True,
         #'allow_fallback': False,
         'convert_time': [],
+        'convert_msg': [],
         'convert_status': [],
         'load_status': [],
+        'load_msg': [],
+        'infer_msg': [],
         'infer_status': [],
-        'inference_time': [],
+        'infer_time': [],
         'load_time': []
     }
+    def summarize_data(model_name, debug_info):
+        num_subgraphs = len(debug_info['convert_status'])
+        num_converted = sum(debug_info['convert_status'])
+        total_convert_time = sum(debug_info['convert_time'])
+        num_loaded = sum(debug_info['load_status'])
+        num_inferred = sum(debug_info['infer_status'])
+        total_inference_time = sum(debug_info['infer_time'])
+        total_load_time = sum(debug_info['load_time'])
+        convert_msg = ';'.join(debug_info['convert_msg'])
+        load_msg = ';'.join(debug_info['load_msg'])
+        infer_msg = ';'.join(debug_info['infer_msg'])
+        
+        return ([
+            'model_name',
+            'num_clusters',
+            'num_converted',
+            'conversion_time',
+            'num_loaded',
+            'load_time',
+            'num_inferred',
+            'infer_time',
+            'convert_msg',
+            'load_msg',
+            'infer_msg'
+        ]), [model_name, num_subgraphs, num_converted, total_convert_time, num_loaded, total_load_time, num_inferred, total_inference_time, convert_msg, load_msg, infer_msg]
 
     @torchdynamo.optimizations.backends.create_backend
     def openvino_debug(subgraph, **kwargs):
@@ -850,6 +888,7 @@ def ov_debug_experiment(args, model_iter_fn, model, example_inputs):
             if profile:
                 debug_info['convert_status'].append(1)
                 debug_info['convert_time'].append(t1 - t0)
+                debug_info['convert_msg'].append('')
             try:
                 for idx, input_data in enumerate(subgraph.example_inputs):
                     om.inputs[idx].get_node().set_element_type(dtype_mapping[input_data.dtype])
@@ -862,7 +901,7 @@ def ov_debug_experiment(args, model_iter_fn, model, example_inputs):
                 if profile:
                     debug_info['load_status'].append(1)
                     debug_info['load_time'].append(t3 - t2)
-
+                    debug_info['load_msg'].append('')
                 def _call(*args):
                     ov_inputs = [a.detach().cpu().numpy() for a in args]
                     try:
@@ -872,47 +911,38 @@ def ov_debug_experiment(args, model_iter_fn, model, example_inputs):
                         if profile:
                             debug_info['infer_time'].append(t5 - t4)
                             debug_info['infer_status'].append(1)
+                            debug_info['infer_msg'].append('')
                     except Exception as e:
                         if profile:
                             debug_info['infer_status'].append(0)
+                            debug_info['infer_msg'].append(str(e))
                         return subgraph.model.forward(*args)
                     result = [torch.from_numpy(res[out]) for out in compiled_model.outputs]
                     return result
-
+                   
+                _call(*subgraph.example_inputs)
                 return subgraph.wrap_returns(_call)
             except Exception as e:
                 if allow_fallback:
                     if profile:
                         debug_info['load_status'].append(0)
+                        debug_info['load_msg'].append(str(e))
                         debug_info['infer_status'].append(0)
+                        debug_info['infer_msg'].append('load failed')
                     return subgraph.model.forward
                 raise e
         except Exception as e:
             if profile:
                 debug_info['convert_status'].append(0)
+                debug_info['convert_msg'].append(str(e))
                 debug_info['load_status'].append(0)
+                debug_info['load_msg'].append('convert failed')
                 debug_info['infer_status'].append(0)
+                debug_info['infer_msg'].append('convert failed')
             if not allow_fallback:
-                raise e
+                raise e            
         return subgraph.model.forward
-    def summarize_data(model_name, debug_info):
-        num_subgraphs = len(debug_info['convert_status'])
-        num_converted = len(debug_info['convert_status'])
-        total_convert_time = sum(debug_info['convert_time'])
-        num_loaded = sum(debug_info['load_status'])
-        num_inferred = sum(debug_info['infer_status'])
-        total_inference_time = sum(debug_info['inference_time'])
-        total_load_time = sum(debug_info['load_time'])
-        return ([
-            'model_name',
-            'num_clusters',
-            'num_converted',
-            'conversion_time',
-            'num_loaded',
-            'load_time',
-            'num_inferred',
-            'inference_time'
-        ]), [model_name, num_subgraphs, num_converted, total_convert_time, num_loaded, total_load_time, num_inferred, total_inference_time]
+    
     model.eval()
     # def debug_backend(model, example_inputs):
     #     return backends.openvino(model, example_inputs, **debug_info)
@@ -920,8 +950,8 @@ def ov_debug_experiment(args, model_iter_fn, model, example_inputs):
     debug_model = torchdynamo.optimize(openvino_debug)(model)
     result = model_iter_fn(debug_model, example_inputs)
 
-    debug_output_file = 'debug.csv'
-    output_csv(output_filename, *summarize_data(current_name, debug_info))
+    debug_output_filename = output_filename.replace('.csv', 'debug.csv')
+    output_csv(debug_output_filename, *summarize_data(current_name, debug_info))
 
 
 

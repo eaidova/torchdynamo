@@ -852,6 +852,7 @@ def openvino(subgraph, **kwargs):
         if profile:
             kwargs['convert_status'].append(1)
             kwargs['convert_time'].append(t1 - t0)
+            kwargs['convert_msg'].append('')
         try:
             for idx, input_data in enumerate(subgraph.example_inputs):
                 om.inputs[idx].get_node().set_element_type(dtype_mapping[input_data.dtype])
@@ -864,6 +865,7 @@ def openvino(subgraph, **kwargs):
             if profile:
                 kwargs['load_status'].append(1)
                 kwargs['load_time'].append(t3 - t2)
+                kwargs['load_msg'].append('')
             def _call(*args):
                 ov_inputs = [a.detach().cpu().numpy() for a in args]
                 try:
@@ -873,9 +875,11 @@ def openvino(subgraph, **kwargs):
                     if profile:
                         kwargs['infer_time'].append(t5 - t4)
                         kwargs['infer_status'].append(1)
+                        kwargs['infer_msg'].append(str(e))
                 except Exception as e:
                     if profile:
                         kwargs['infer_status'].append(0)
+                        kwargs['infer_msg'].append('')
                     return subgraph.model.forward(*args)
                 result = [torch.from_numpy(res[out]) for out in compiled_model.outputs]
                 return result
@@ -884,14 +888,19 @@ def openvino(subgraph, **kwargs):
             if allow_fallback:
                 if profile:
                     kwargs['load_status'].append(0)
+                    kwargs['load_msg'].append(str(e))
                     kwargs['infer_status'].append(0)
+                    kwargs['infer_msg'].append('load failed')
                 return subgraph.model.forward
             raise e
     except Exception as e:
         if profile:
             kwargs['convert_status'].append(0)
+            kwargs['convert_msg'].append(str(e))
             kwargs['load_status'].append(0)
+            kwargs['load_msg'].append('convert failed')
             kwargs['infer_status'].append(0)
+            kwargs['infer_msg'].append('convert failed')
         if not allow_fallback:
             raise e            
     return subgraph.model.forward
