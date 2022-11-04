@@ -8,7 +8,6 @@ import tempfile
 
 import numpy as np
 import torch
-from zmq import device
 
 from ..utils import identity
 from .subgraph import SubGraph
